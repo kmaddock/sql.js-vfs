@@ -161,7 +161,7 @@ out/sqlite3.bc: sqlite-src/$(SQLITE_AMALGAMATION)/sqlite3.c
 	# Generate llvm bitcode
 	$(EMCC) $(SQLITE_COMPILATION_FLAGS) -c sqlite-src/$(SQLITE_AMALGAMATION)/sqlite3.c -o $@
 
-out/vfs.bc: src/vfs.c
+out/vfs.bc: src/vfs.c sqlite-src/$(SQLITE_AMALGAMATION)
 	mkdir -p out
 	# Generate llvm bitcode
 	$(EMCC) $(SQLITE_COMPILATION_FLAGS) -Isqlite-src/$(SQLITE_AMALGAMATION) -c src/vfs.c -o $@
@@ -189,7 +189,7 @@ cache/$(EXTENSION_FUNCTIONS):
 .PHONY: sqlite-src
 sqlite-src: sqlite-src/$(SQLITE_AMALGAMATION) sqlite-src/$(SQLITE_AMALGAMATION)/$(EXTENSION_FUNCTIONS)
 
-sqlite-src/$(SQLITE_AMALGAMATION): cache/$(SQLITE_AMALGAMATION).zip sqlite-src/$(SQLITE_AMALGAMATION)/$(EXTENSION_FUNCTIONS)
+sqlite-src/$(SQLITE_AMALGAMATION) sqlite-src/$(SQLITE_AMALGAMATION)/sqlite3.c: cache/$(SQLITE_AMALGAMATION).zip sqlite-src/$(SQLITE_AMALGAMATION)/$(EXTENSION_FUNCTIONS)
 	mkdir -p sqlite-src/$(SQLITE_AMALGAMATION)
 	echo '$(SQLITE_AMALGAMATION_ZIP_SHA3)  ./cache/$(SQLITE_AMALGAMATION).zip' > cache/check.txt
 	sha3sum -a 256 -c cache/check.txt
@@ -204,7 +204,6 @@ sqlite-src/$(SQLITE_AMALGAMATION)/$(EXTENSION_FUNCTIONS): cache/$(EXTENSION_FUNC
 	echo '$(EXTENSION_FUNCTIONS_SHA1)  ./cache/$(EXTENSION_FUNCTIONS)' > cache/check.txt
 	sha1sum -c cache/check.txt
 	cp 'cache/$(EXTENSION_FUNCTIONS)' $@
-
 
 .PHONY: clean
 clean:
