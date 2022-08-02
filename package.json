@@ -19,7 +19,7 @@
 	"license": "MIT",
 	"main": "./dist/sql-wasm.js",
 	"scripts": {
-		"build": "make",
+		"build": "make -j4",
 		"rebuild": "npm run clean && npm run build",
 		"clean": "make clean",
 		"test": "npm run lint && npm run test-asm && npm run test-asm-debug && npm run test-wasm && npm run test-wasm-debug && npm run test-asm-memory-growth",

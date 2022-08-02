@@ -72,7 +72,7 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
     // var - Encodings, used for registering functions.
     var SQLITE_UTF8 = 1;
     // var - cwrap function
-    var sqlite3_open = cwrap("sqlite3_open", "number", ["string", "number"]);
+    var sqlite3_open = cwrap("sqlite3_open", "number", ["string", "number"], {async: true});
     var sqlite3_close_v2 = cwrap("sqlite3_close_v2", "number", ["number"]);
     var sqlite3_exec = cwrap(
         "sqlite3_exec",
@@ -94,7 +94,8 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
     var sqlite3_prepare_v2_sqlptr = cwrap(
         "sqlite3_prepare_v2",
         "number",
-        ["number", "number", "number", "number", "number"]
+        ["number", "number", "number", "number", "number"],
+        {async: true}
     );
     var sqlite3_bind_text = cwrap(
         "sqlite3_bind_text",
@@ -122,7 +123,7 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
         "number",
         ["number", "string"]
     );
-    var sqlite3_step = cwrap("sqlite3_step", "number", ["number"]);
+    var sqlite3_step = cwrap("sqlite3_step", "number", ["number"], {async: true});
     var sqlite3_errmsg = cwrap("sqlite3_errmsg", "string", ["number"]);
     var sqlite3_column_count = cwrap(
         "sqlite3_column_count",
@@ -231,6 +232,8 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
         ["number"]
     );
 
+    const register_my_vfs = cwrap("register_my_vfs", "number", []);
+
     /**
     * @classdesc
     * Represents a prepared statement.
@@ -331,12 +334,12 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
     @return {boolean} true if a row of result available
     @throws {String} SQLite Error
      */
-    Statement.prototype["step"] = function step() {
+    Statement.prototype["step"] = async function step() {
         if (!this.stmt) {
             throw "Statement closed";
         }
         this.pos = 1;
-        var ret = sqlite3_step(this.stmt);
+        var ret = await sqlite3_step(this.stmt);
         switch (ret) {
             case SQLITE_ROW:
                 return true;
@@ -740,7 +743,7 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
      @return {StatementIterator.StatementIteratorResult}
      @throws {String} SQLite error or invalid iterator error
      */
-    StatementIterator.prototype["next"] = function next() {
+    StatementIterator.prototype["next"] = async function next() {
         if (this.sqlPtr === null) {
             return { done: true };
         }
@@ -757,7 +760,7 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
         setValue(apiTemp, 0, "i32");
         setValue(pzTail, 0, "i32");
         try {
-            this.db.handleError(sqlite3_prepare_v2_sqlptr(
+            this.db.handleError(await sqlite3_prepare_v2_sqlptr(
                 this.db.db,
                 this.nextSqlPtr,
                 -1,
@@ -814,20 +817,26 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
     * @param {number[]} data An array of bytes representing
     * an SQLite database file
     */
-    function Database(data) {
+    function Database() {
+        register_my_vfs();
+
         this.filename = "dbfile_" + (0xffffffff * Math.random() >>> 0);
-        if (data != null) {
-            FS.createDataFile("/", this.filename, data, true, true);
-        }
-        this.handleError(sqlite3_open(this.filename, apiTemp));
-        this.db = getValue(apiTemp, "i32");
-        registerExtensionFunctions(this.db);
+        
         // A list of all prepared statements of the database
         this.statements = {};
         // A list of all user function of the database
         // (created by create_function call)
         this.functions = {};
     }
+
+    Database.prototype["open"] = async function open(data) {
+        if (data != null) {
+            FS.createDataFile("/", this.filename, data, true, true);
+        }
+        this.handleError(await sqlite3_open(this.filename, apiTemp));
+        this.db = getValue(apiTemp, "i32");
+        registerExtensionFunctions(this.db);
+    };
 
     /** Execute an SQL query, ignoring the rows it returns.
     @param {string} sql a string containing some SQL text to execute
@@ -928,7 +937,7 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
     (separated by `;`). This limitation does not apply to params as an object.
     * @return {Database.QueryExecResult[]} The results of each statement
     */
-    Database.prototype["exec"] = function exec(sql, params, config) {
+    Database.prototype["exec"] = async function exec(sql, params, config) {
         if (!this.db) {
             throw "Database closed";
         }
@@ -941,7 +950,7 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
             while (getValue(nextSqlPtr, "i8") !== NULL) {
                 setValue(apiTemp, 0, "i32");
                 setValue(pzTail, 0, "i32");
-                this.handleError(sqlite3_prepare_v2_sqlptr(
+                this.handleError(await sqlite3_prepare_v2_sqlptr(
                     this.db,
                     nextSqlPtr,
                     -1,
@@ -958,7 +967,7 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
                     if (params != null) {
                         stmt.bind(params);
                     }
-                    while (stmt["step"]()) {
+                    while (await stmt["step"]()) {
                         if (curresult === null) {
                             curresult = {
                                 columns: stmt["getColumnNames"](),
@@ -977,6 +986,24 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
             throw errCaught;
         } finally {
             stackRestore(stack);
+        }
+    };
+
+    // Execute the sql, retry on BUSY error
+    Database.prototype["execRetry"] = async function execRetry(sql, params, config) {
+        while (true) {
+            try { 
+                return await this["exec"](sql, params, config);
+            } catch (e) { 
+                if (e.cause == Module.BUSY) {
+                    if (!this.get_autocommit()) {
+                        // A transaction was in progress, roll it back and try again
+                        await this["exec"]("ROLLBACK TRANSACTION");
+                    }
+                    continue;
+                }
+                throw e;
+            }
         }
     };
 
@@ -1117,7 +1144,7 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
             return null;
         }
         errmsg = sqlite3_errmsg(this.db);
-        throw new Error(errmsg);
+        throw new Error(`(${returnCode}) ${errmsg}`, { cause: returnCode });
     };
 
     /** Returns the number of changed rows (modified, inserted or deleted)
@@ -1229,6 +1256,139 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
         return this;
     };
 
+    // Returns the autocommit status.
+    // If a transaction is in progress and fails, this will return false if the
+    // transaction is still open!
+    Database.prototype["get_autocommit"] = function get_autocommit() {
+        return Module._sqlite3_get_autocommit(this.db) != 0;
+    };
+
     // export Database to Module
     Module.Database = Database;
+
+    Module.vfs = {};
+
+    Module["registerVfs"] = function(vfs) {
+        Module.vfs = vfs;
+    }
+
+    // Errors https://www.sqlite.org/rescode.html#error
+    Module['OK'] = SQLITE_OK;
+    Module['ERROR'] = 1;
+    Module['PERM'] = 3;
+    Module['ABORT'] = 4;
+    Module['BUSY'] = 5;
+    Module['LOCKED'] = 6;
+    Module['NOMEM'] = 7;
+    Module['IOERR'] = 10;
+    Module['NOTFOUND'] = 12;
+    Module['FULL'] = 13;
+    Module['CANTOPEN'] = 14;
+    Module['NOLFS'] = 22;
+
+    Module['IOERR_READ'] = 266;
+    Module['IOERR_SHORT_READ'] = 522;
+    Module['IOERR_COMMIT_ATOMIC'] = 7690;
+    Module['IOERR_ROLLBACK_ATOMIC'] = 7946;
+    Module['IOERR_CORRUPTFS'] = 8458;
+
+    // Open
+    Module['OPEN_READONLY']         = 0x00000001;  /* Ok for sqlite3_open_v2() */
+    Module['OPEN_READWRITE']        = 0x00000002;  /* Ok for sqlite3_open_v2() */
+    Module['OPEN_CREATE']           = 0x00000004;  /* Ok for sqlite3_open_v2() */
+    Module['OPEN_DELETEONCLOSE']    = 0x00000008;  /* VFS only */
+    Module['OPEN_EXCLUSIVE']        = 0x00000010;  /* VFS only */
+    Module['OPEN_AUTOPROXY']        = 0x00000020;  /* VFS only */
+    Module['OPEN_URI']              = 0x00000040;  /* Ok for sqlite3_open_v2() */
+    Module['OPEN_MEMORY']           = 0x00000080;  /* Ok for sqlite3_open_v2() */
+    Module['OPEN_MAIN_DB']          = 0x00000100;  /* VFS only */
+    Module['OPEN_TEMP_DB']          = 0x00000200;  /* VFS only */
+    Module['OPEN_TRANSIENT_DB']     = 0x00000400;  /* VFS only */
+    Module['OPEN_MAIN_JOURNAL']     = 0x00000800;  /* VFS only */
+    Module['OPEN_TEMP_JOURNAL']     = 0x00001000;  /* VFS only */
+    Module['OPEN_SUBJOURNAL']       = 0x00002000;  /* VFS only */
+    Module['OPEN_SUPER_JOURNAL']    = 0x00004000;  /* VFS only */
+    Module['OPEN_NOMUTEX']          = 0x00008000;  /* Ok for sqlite3_open_v2() */
+    Module['OPEN_FULLMUTEX']        = 0x00010000;  /* Ok for sqlite3_open_v2() */
+    Module['OPEN_SHAREDCACHE']      = 0x00020000;  /* Ok for sqlite3_open_v2() */
+    Module['OPEN_PRIVATECACHE']     = 0x00040000;  /* Ok for sqlite3_open_v2() */
+    Module['OPEN_WAL']              = 0x00080000;  /* VFS only */
+    Module['OPEN_NOFOLLOW']         = 0x01000000;  /* Ok for sqlite3_open_v2() */
+    Module['OPEN_EXRESCODE']        = 0x02000000;  /* Extended result codes */
+
+    // Access
+    Module['ACCESS_EXISTS']    = 0
+    Module['ACCESS_READWRITE'] = 1
+    Module['ACCESS_READ']      = 2
+
+    // Sync
+    Module['SYNC_NORMAL']   = 2;
+    Module['SYNC_FULL']     = 3;
+    Module['SYNC_DATAONLY'] = 0x10
+
+    // Lock
+    Module['LOCK_NONE']      = 0;
+    Module['LOCK_SHARED']    = 1;
+    Module['LOCK_RESERVED']  = 2;
+    Module['LOCK_PENDING']   = 3;
+    Module['LOCK_EXCLUSIVE'] = 4;
+
+    // Device characteristics
+    Module['IOCAP_ATOMIC']                 = 0x00000001;
+    Module['IOCAP_ATOMIC512']              = 0x00000002;
+    Module['IOCAP_ATOMIC1K']               = 0x00000004;
+    Module['IOCAP_ATOMIC2K']               = 0x00000008;
+    Module['IOCAP_ATOMIC4K']               = 0x00000010;
+    Module['IOCAP_ATOMIC8K']               = 0x00000020;
+    Module['IOCAP_ATOMIC16K']              = 0x00000040;
+    Module['IOCAP_ATOMIC32K']              = 0x00000080;
+    Module['IOCAP_ATOMIC64K']              = 0x00000100;
+    Module['IOCAP_SAFE_APPEND']            = 0x00000200;
+    Module['IOCAP_SEQUENTIAL']             = 0x00000400;
+    Module['IOCAP_UNDELETABLE_WHEN_OPEN']  = 0x00000800;
+    Module['IOCAP_POWERSAFE_OVERWRITE']    = 0x00001000;
+    Module['IOCAP_IMMUTABLE']              = 0x00002000;
+    Module['IOCAP_BATCH_ATOMIC']           = 0x00004000;
+
+    // FileControl
+    Module['FCNTL_LOCKSTATE']               = 1;
+    Module['FCNTL_GET_LOCKPROXYFILE']       = 2;
+    Module['FCNTL_SET_LOCKPROXYFILE']       = 3;
+    Module['FCNTL_LAST_ERRNO']              = 4;
+    Module['FCNTL_SIZE_HINT']               = 5;
+    Module['FCNTL_CHUNK_SIZE']              = 6;
+    Module['FCNTL_FILE_POINTER']            = 7;
+    Module['FCNTL_SYNC_OMITTED']            = 8;
+    Module['FCNTL_WIN32_AV_RETRY']          = 9;
+    Module['FCNTL_PERSIST_WAL']            = 10;
+    Module['FCNTL_OVERWRITE']              = 11;
+    Module['FCNTL_VFSNAME']                = 12;
+    Module['FCNTL_POWERSAFE_OVERWRITE']    = 13;
+    Module['FCNTL_PRAGMA']                 = 14;
+    Module['FCNTL_BUSYHANDLER']            = 15;
+    Module['FCNTL_TEMPFILENAME']           = 16;
+    Module['FCNTL_MMAP_SIZE']              = 18;
+    Module['FCNTL_TRACE']                  = 19;
+    Module['FCNTL_HAS_MOVED']              = 20;
+    Module['FCNTL_SYNC']                   = 21;
+    Module['FCNTL_COMMIT_PHASETWO']        = 22;
+    Module['FCNTL_WIN32_SET_HANDLE']       = 23;
+    Module['FCNTL_WAL_BLOCK']              = 24;
+    Module['FCNTL_ZIPVFS']                 = 25;
+    Module['FCNTL_RBU']                    = 26;
+    Module['FCNTL_VFS_POINTER']            = 27;
+    Module['FCNTL_JOURNAL_POINTER']        = 28;
+    Module['FCNTL_WIN32_GET_HANDLE']       = 29;
+    Module['FCNTL_PDB']                    = 30;
+    Module['FCNTL_BEGIN_ATOMIC_WRITE']     = 31;
+    Module['FCNTL_COMMIT_ATOMIC_WRITE']    = 32;
+    Module['FCNTL_ROLLBACK_ATOMIC_WRITE']  = 33;
+    Module['FCNTL_LOCK_TIMEOUT']           = 34;
+    Module['FCNTL_DATA_VERSION']           = 35;
+    Module['FCNTL_SIZE_LIMIT']             = 36;
+    Module['FCNTL_CKPT_DONE']              = 37;
+    Module['FCNTL_RESERVE_BYTES']          = 38;
+    Module['FCNTL_CKPT_START']             = 39;
+    Module['FCNTL_EXTERNAL_READER']        = 40;
+    Module['FCNTL_CKSM_FILE']              = 41;
 };

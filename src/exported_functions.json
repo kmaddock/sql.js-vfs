@@ -1,4 +1,6 @@
 [
+"_register_my_vfs",
+"_unregister_my_vfs",
 "_malloc",
 "_free",
 "_sqlite3_open",
@@ -23,6 +25,7 @@
 "_sqlite3_column_bytes",
 "_sqlite3_column_type",
 "_sqlite3_column_name",
+"_sqlite3_get_autocommit",
 "_sqlite3_reset",
 "_sqlite3_clear_bindings",
 "_sqlite3_finalize",

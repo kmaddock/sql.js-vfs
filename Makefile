@@ -24,7 +24,12 @@ SQLITE_COMPILATION_FLAGS = \
 	-DSQLITE_ENABLE_FTS3 \
 	-DSQLITE_ENABLE_FTS3_PARENTHESIS \
 	-DSQLITE_THREADSAFE=0 \
-	-DSQLITE_ENABLE_NORMALIZE
+	-DSQLITE_ENABLE_NORMALIZE \
+	-DSQLITE_DQS=0 \
+	-DSQLITE_LIKE_DOESNT_MATCH_BLOBS \
+	-DSQLITE_OMIT_DEPRECATED \
+	-DSQLITE_OMIT_PROGRESS_CALLBACK \
+	-DSQLITE_ENABLE_BATCH_ATOMIC_WRITE
 
 # When compiling to WASM, enabling memory-growth is not expected to make much of an impact, so we enable it for all builds
 # Since tihs is a library and not a standalone executable, we don't want to catch unhandled Node process exceptions
@@ -37,8 +42,11 @@ EMFLAGS = \
 	-s EXPORTED_RUNTIME_METHODS=@src/exported_runtime_methods.json \
 	-s SINGLE_FILE=0 \
 	-s NODEJS_CATCH_EXIT=0 \
-	-s NODEJS_CATCH_REJECTION=0
-
+	-s NODEJS_CATCH_REJECTION=0 \
+	-s ASYNCIFY \
+	-s ENVIRONMENT='web' \
+	-s MODULARIZE=1 
+	
 EMFLAGS_ASM = \
 	-s WASM=0
 
@@ -50,16 +58,21 @@ EMFLAGS_WASM = \
 	-s WASM=1 \
 	-s ALLOW_MEMORY_GROWTH=1
 
-EMFLAGS_OPTIMIZED= \
+#EMFLAGS_OPTIMIZED= \
 	-Oz \
 	-flto \
 	--closure 1
 
+EMFLAGS_OPTIMIZED= \
+	-Oz \
+	-flto
+
+
 EMFLAGS_DEBUG = \
 	-s ASSERTIONS=1 \
-	-O1
+	-Os 
 
-BITCODE_FILES = out/sqlite3.bc out/extension-functions.bc
+BITCODE_FILES = out/sqlite3.bc out/extension-functions.bc out/vfs.bc
 
 OUTPUT_WRAPPER_FILES = src/shell-pre.js src/shell-post.js
 
@@ -70,7 +83,8 @@ EMFLAGS_PRE_JS_FILES = \
 
 EXPORTED_METHODS_JSON_FILES = src/exported_functions.json src/exported_runtime_methods.json
 
-all: optimized debug worker
+all: dist/sql-wasm-debug.js dist/sql-wasm.js
+#all: optimized debug worker
 
 .PHONY: debug
 debug: dist/sql-asm-debug.js dist/sql-wasm-debug.js
@@ -83,9 +97,9 @@ dist/sql-asm-debug.js: $(BITCODE_FILES) $(OUTPUT_WRAPPER_FILES) $(SOURCE_API_FIL
 
 dist/sql-wasm-debug.js: $(BITCODE_FILES) $(OUTPUT_WRAPPER_FILES) $(SOURCE_API_FILES) $(EXPORTED_METHODS_JSON_FILES)
 	$(EMCC) $(EMFLAGS) $(EMFLAGS_DEBUG) $(EMFLAGS_WASM) $(BITCODE_FILES) $(EMFLAGS_PRE_JS_FILES) -o $@
-	mv $@ out/tmp-raw.js
-	cat src/shell-pre.js out/tmp-raw.js src/shell-post.js > $@
-	rm out/tmp-raw.js
+	#mv $@ out/tmp-raw.js
+	#cat src/shell-pre.js out/tmp-raw.js src/shell-post.js > $@
+	#rm out/tmp-raw.js
 
 .PHONY: optimized
 optimized: dist/sql-asm.js dist/sql-wasm.js dist/sql-asm-memory-growth.js
@@ -98,9 +112,9 @@ dist/sql-asm.js: $(BITCODE_FILES) $(OUTPUT_WRAPPER_FILES) $(SOURCE_API_FILES) $(
 
 dist/sql-wasm.js: $(BITCODE_FILES) $(OUTPUT_WRAPPER_FILES) $(SOURCE_API_FILES) $(EXPORTED_METHODS_JSON_FILES)
 	$(EMCC) $(EMFLAGS) $(EMFLAGS_OPTIMIZED) $(EMFLAGS_WASM) $(BITCODE_FILES) $(EMFLAGS_PRE_JS_FILES) -o $@
-	mv $@ out/tmp-raw.js
-	cat src/shell-pre.js out/tmp-raw.js src/shell-post.js > $@
-	rm out/tmp-raw.js
+	#mv $@ out/tmp-raw.js
+	#cat src/shell-pre.js out/tmp-raw.js src/shell-post.js > $@
+	#rm out/tmp-raw.js
 
 dist/sql-asm-memory-growth.js: $(BITCODE_FILES) $(OUTPUT_WRAPPER_FILES) $(SOURCE_API_FILES) $(EXPORTED_METHODS_JSON_FILES)
 	$(EMCC) $(EMFLAGS) $(EMFLAGS_OPTIMIZED) $(EMFLAGS_ASM_MEMORY_GROWTH) $(BITCODE_FILES) $(EMFLAGS_PRE_JS_FILES) -o $@
@@ -142,10 +156,15 @@ dist/worker.sql-wasm-debug.js: dist/sql-wasm-debug.js src/worker.js
 # 	#mv out/sql-wasm-debug.wasm dist/sql-wasm-debug.wasm
 # 	rm out/tmp-raw.js
 
-out/sqlite3.bc: sqlite-src/$(SQLITE_AMALGAMATION)
+out/sqlite3.bc: sqlite-src/$(SQLITE_AMALGAMATION)/sqlite3.c
 	mkdir -p out
 	# Generate llvm bitcode
 	$(EMCC) $(SQLITE_COMPILATION_FLAGS) -c sqlite-src/$(SQLITE_AMALGAMATION)/sqlite3.c -o $@
+
+out/vfs.bc: src/vfs.c
+	mkdir -p out
+	# Generate llvm bitcode
+	$(EMCC) $(SQLITE_COMPILATION_FLAGS) -Isqlite-src/$(SQLITE_AMALGAMATION) -c src/vfs.c -o $@
 
 # Since the extension-functions.c includes other headers in the sqlite_amalgamation, we declare that this depends on more than just extension-functions.c
 out/extension-functions.bc: sqlite-src/$(SQLITE_AMALGAMATION)

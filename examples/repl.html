@@ -5,28 +5,302 @@
 <head>
 	<meta charset="utf8">
 	<title>SQL REPL</title>
-	<script src="../dist/sql-wasm.js"></script>
+	<script src="../dist/sql-wasm-debug.js"></script>
 </head>
 
 <body>
-	<input type='text' id='input' placeholder="ENTER SOME SQL" size='50'
-		value="CREATE TABLE test(val);INSERT INTO test VALUES (666); SELECT * FROM test">
+	<textarea  id='input' placeholder="ENTER SOME SQL" cols="80" rows="25">
+PRAGMA journal_mode = MEMORY; -- Required for batch atomic write
+BEGIN TRANSACTION;
+CREATE TABLE IF NOT EXISTS test(val);
+INSERT INTO test VALUES (666);
+COMMIT;
+SELECT * FROM test
+	
+	</textarea>
 	<button id='submit'>Execute</button>
 	<pre id='result'></pre>
 	<pre id='error'></pre>
-	<script>
+	<script type="module">
+		let SQL = await initSqlJs({ locateFile: filename => `../dist/${filename}` });
+
+		class MyFile {
+			constructor(vfs, handle) {
+				this.handle = handle;
+				this.vfs = vfs;
+				this.buffer = new Uint8Array();
+				this.lockLevel = 0;
+				this.writes = [];
+				this.atomic = false;
+			}
+		}
+
+		// In-memory (atomic) filesystem
+		class MyVfs {
+			constructor() {
+				// Map filename to file
+				this.files = {};
+				// Map open file handles to file
+				this.fileHandles = {};
+				// Handle allocator
+				this.next_handle = 1;
+			}
+
+			// Debug: Map integer flags to strings
+			_flags(prefix, flags) {
+				let flagDesc = [];
+				for (const key of Object.keys(SQL)) {
+					if (key.startsWith(prefix) && (flags & SQL[key]) != 0) {
+						flagDesc.push(key);
+					}
+				}
+				return flagDesc.join("|");
+			}
+
+			// Debug: Map an enum value to string
+			_enum(prefix, value) {
+				for (const key of Object.keys(SQL)) {
+					if (key.startsWith(prefix) && SQL[key] === value) {
+						return key;
+					}
+				}
+
+				return undefined;
+			}
+
+			// Open a file
+			async open(filename, flags) {
+				let handle = this.next_handle++;
+				let flagDesc = this._flags("OPEN_", flags);
+				console.log(`open(${filename}, ${flags} ${flagDesc}) = ${handle}`);
+				
+				let file = this.files[filename] || new MyFile(this, handle);
+				this.fileHandles[handle] = file;
+				this.files[filename] = file;
+				return [SQL.OK, handle, 0];
+			}
+
+			// Test access to a file
+			async access(filename, flags) {
+				let result = false;
+				if (flags == SQL.ACCESS_EXISTS || flags == SQL.ACCESS_READWRITE || flags == SQL.ACCESS_READ) {
+					result = filename in this.files;
+				}
+
+				let flagDesc = this._enum("ACCESS_", flags);
+				console.log(`access(${filename}, ${flags} ${flagDesc}) = ${result}`);
+				return [SQL.OK, result];
+			}
+
+			// Delete a file
+			async delete(filename, syncDir) {
+				console.log(`delete(${filename}, ${syncDir})`);
+				delete this.files[filename];
+				return SQL.OK;
+			}
+
+			// Close a file
+			async fileClose(file) {
+				console.log(`close(${file})`);
+				this.fileHandles[file].writes = [];
+				delete this.fileHandles[file];
+				return SQL.OK;
+			}
+
+			// Sync a file. Ensure all changes are written to permanent storage
+			async fileSync(file, flags) {
+				let flagDesc = this._flags("SYNC_", flags);
+				console.log(`sync(${file}, ${flags} ${flagDesc})`);
+				return SQL.OK;
+			}
+
+			// Returns the size of a file
+			async fileSize(file) {
+				let size = this.fileHandles[file].buffer.byteLength;
+				console.log(`size(${file}) = ${size}`);
+				return [SQL.OK, size];
+			}
+
+			// Read data from a file
+			async fileRead(fileHandle, buffer, offset) {
+				console.log(`read(${fileHandle}, ${buffer.byteLength}, ${offset})`);
+
+				let file = this.fileHandles[fileHandle];
+
+				// If short read: memset remaining bytes read to 0 and return SQL.IOERR_SHORT_READ
+				buffer.fill(0);
+
+				if (offset < file.buffer.byteLength) {
+					let length = Math.min(buffer.byteLength, file.buffer.byteLength - offset);
+					buffer.set(file.buffer.subarray(offset, offset + buffer.length));
+
+					return offset + buffer.byteLength <= file.buffer.byteLength ? SQL.OK : SQL.IOERR_SHORT_READ;
+				}
+
+				// If failed, return SQL.IOERR_CORRUPTFS or SQL.IOERR_READ				
+				return SQL.IOERR_SHORT_READ;
+			}
+
+			// Write data to a file
+			async fileWrite(fileHandle, buffer, offset) {
+				console.log(`write(${fileHandle}, ${buffer.byteLength}, ${offset})`);
+				let file = this.fileHandles[fileHandle];
+
+				if (file.atomic) {
+					file.writes.push([buffer, offset]);
+					return SQL.OK;
+				}
+				return SQL.BUSY; // only atomic supported! Force a retry.
+				
+				// Resize the buffer
+				if (offset + buffer.byteLength > file.buffer.byteLength) {
+					let oldBuffer = file.buffer;
+					file.buffer = new Uint8Array(offset + buffer.byteLength);
+					file.buffer.set(oldBuffer);
+				}
+
+				file.buffer.set(buffer, offset);
+				return SQL.OK;
+			}
+
+			// Get device characteristics
+			async fileDeviceCharacteristics(file) {
+				return SQL.IOCAP_BATCH_ATOMIC;
+			}
+
+			// Get file sector size
+			async fileSectorSize(file) {
+				return 4096;
+			}
+
+			// Extended control of a file
+			async fileControl(fileHandle, op, arg) {
+				let opDesc = this._enum("FCNTL_", op);
+				console.log(`control(${fileHandle}, ${opDesc} (${op}), ${arg})`);
+
+				let file = this.fileHandles[fileHandle];
+				switch (op) {
+					// Increase file size
+					case SQL.FCNTL_SIZE_HINT:
+						if (file.atomic) {
+							return SQL.OK;
+						}
+						let newSize = arg;
+						if (newSize > file.buffer.byteLength) {
+							let oldBuffer = file.buffer;
+							file.buffer = new Uint8Array(newSize);
+							file.buffer.set(oldBuffer);
+						}
+
+						return SQL.OK;
+					// Begin an atomic write
+					case SQL.FCNTL_BEGIN_ATOMIC_WRITE:
+						file.atomic = true;
+						return SQL.OK;
+					// Commit an atomic write
+					case SQL.FCNTL_COMMIT_ATOMIC_WRITE:
+						// Testing - inject failures
+						if (Math.random() < 0.5) {
+							file.writes = [];
+							file.atomic = false;
+							return SQL.IOERR_COMMIT_ATOMIC;
+						}
+						this._fileAtomicFlush(fileHandle);
+						return SQL.OK;
+					// Rollback an atomic write
+					case SQL.FCNTL_ROLLBACK_ATOMIC_WRITE:
+						file.writes = [];
+						file.atomic = false;
+						return SQL.OK;
+					default:
+						break;
+				}	
+
+				return SQL.NOTFOUND;
+			}
+
+			// Increase the lock level on the file
+			async fileLock(fileHandle, lockLevel) {
+				let file = this.fileHandles[fileHandle];
+				let oldLockDesc = this._enum("LOCK_", file.lockLevel);
+				let newLockDesc = this._enum("LOCK_", lockLevel);
+				console.log(`lock(${fileHandle}, ${oldLockDesc} (${file.lockLevel}) -> ${newLockDesc} (${lockLevel}))`);
+				file.lockLevel = lockLevel;
+				return SQL.OK;
+			}
+
+			// Testing: Atomically write all queued changes to storage
+			async _fileAtomicFlush(fileHandle) {
+				let file = this.fileHandles[fileHandle];
+				for (let [buffer, offset] of file.writes) {
+					// Resize the buffer
+					if (offset + buffer.byteLength > file.buffer.byteLength) {
+						let oldBuffer = file.buffer;
+						file.buffer = new Uint8Array(offset + buffer.byteLength);
+						file.buffer.set(oldBuffer);
+					}
+
+					file.buffer.set(buffer, offset);
+				}
+				file.writes = [];
+				file.atomic = false;
+			}
+
+			// Reduce the lock level on a file
+			async fileUnlock(fileHandle, lockLevel) {
+				let file = this.fileHandles[fileHandle];
+				let oldLockDesc = this._enum("LOCK_", file.lockLevel);
+				let newLockDesc = this._enum("LOCK_", lockLevel);
+				console.log(`unlock(${fileHandle}, ${oldLockDesc} (${file.lockLevel}) -> ${newLockDesc} (${lockLevel}))`);
+				file.lockLevel = lockLevel;
+
+				return SQL.OK;
+			}
+
+			// Check the lock level on a file
+			async fileCheckReservedLock(file) {
+				let lockLevel = this.fileHandles[file].lockLevel;
+				let desc = this._enum("LOCK_", lockLevel);
+				console.log(`checkReservedLock(${file}) = ${desc} (${lockLevel})`);
+
+				return [SQL.OK, lockLevel];
+			}
+
+			// Truncate a file
+			async fileTruncate(fileHandle, newSize) {
+				let file = this.fileHandles[fileHandle];
+				console.log(`truncate(${fileHandle}, ${file.buffer.length} -> ${newSize})`);
+
+				if (!file.atomic) {
+					return SQL.BUSY;
+				}
+				
+				if (newSize < file.buffer.byteLength) {
+					let oldBuffer = file.buffer;
+					file.buffer = new Uint8Array(newSize);
+					file.buffer.set(oldBuffer.subarray(0, newSize));
+				}
+				
+
+				return SQL.OK;
+			}
+		}
+
+		SQL.registerVfs(new MyVfs());
 
 		//Open a blank database
-		var db;
-		initSqlJs({ locateFile: filename => `../dist/${filename}` }).then(function (SQL) {
-			db = new SQL.Database();
-		});
-
-		document.getElementById('submit').onclick = function () {
+		let db = new SQL.Database();
+		db.open();
+		
+		document.getElementById('submit').onclick = async function () {
 			var sql = document.getElementById('input').value;
 			var result = '', error = '';
-			try { result = db.exec(sql); }
-			catch (e) { error = e; }
+			
+			try { 
+				result = await db.execRetry(sql);
+			} catch (e) { 
+				error = e;
+			}
 			document.getElementById('result').innerHTML = JSON.stringify(result, null, '  ');
 			document.getElementById('error').innerHTML = error;
 		};
